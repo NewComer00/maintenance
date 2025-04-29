@@ -1,117 +1,148 @@
 #!/bin/bash
 
-# Exit on errors, unset variables, and pipeline failures
 set -euo pipefail
 
-# Default values for flags
+# Check if systemctl is available
+command -v systemctl >/dev/null 2>&1 || { echo >&2 "systemctl is required but not installed. Aborting."; exit 1; }
+
+# Default flag values
 DRY_RUN=0
 VERBOSE=0
+SHOW_ONLY=0
 
 # Function to display help
 display_help() {
-    echo "Usage: $0 [-d|--dry-run] [-v|--verbose] <CPU_QUOTA> <USER1> <USER2> ... <USER_N>"
+    echo "Usage: $0 [OPTIONS] <CPU_QUOTA> <USER1> <USER2> ... <USER_N>"
     echo
-    echo "   -d, --dry-run      Display the commands that would be executed, without making any changes."
-    echo "   -v, --verbose      Display detailed information about each operation."
-    echo "   CPU_QUOTA          The CPU quota (as a percentage, e.g., '10%') to set for each user slice."
-    echo "                      To remove the CPU quota, use an empty value for CPU_QUOTA."
-    echo "   USER1 ... USER_N   List of usernames to apply the CPU quota to."
+    echo "Options:"
+    echo "  -d, --dry-run        Show the commands that would be executed without running them"
+    echo "  -v, --verbose        Enable verbose output"
+    echo "  -s, --show           Show current CPUQuotaPerSecUSec for each user and exit"
+    echo "  -h, --help           Display this help message and exit"
     echo
-    echo "Example:"
-    echo "   $0 -d 10% user1 user2     # Display the commands without executing them."
-    echo "   $0 -v 10% user1 user2     # Display detailed information during execution."
-    echo "   $0 10% user1 user2        # Set the CPU quota to 10% for user1 and user2."
-    echo "   $0 '' user1 user2         # Remove the CPU quota for user1 and user2."
+    echo "Arguments:"
+    echo "  CPU_QUOTA            CPU quota to assign (e.g., 10%). Use '' to remove quota"
+    echo "  USER1 ... USER_N     List of users to apply the CPU quota to"
+    echo
+    echo "Examples:"
+    echo "  $0 -d 10% alice bob     # Dry run: show commands for setting 10% quota"
+    echo "  $0 -v 10% alice         # Verbose: set 10% quota for user alice"
+    echo "  $0 '' alice             # Remove CPU quota for user alice"
+    echo "  $0 -s alice bob         # Show current CPUQuotaPerSecUSec for alice and bob"
+    echo
     exit 0
 }
-
-# Check for --help argument
-if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-    display_help
-fi
-
-# Check for --dry-run and --verbose flags
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -d|--dry-run)
-            DRY_RUN=1
-            shift
-            ;;
-        -v|--verbose)
-            VERBOSE=1
-            shift
-            ;;
-        *)
-            break
-            ;;
-    esac
-done
-
-# The first non-option argument should be CPU_QUOTA
-CPU_QUOTA="$1"
-shift  # Now $@ are users
-
-# Check if any users were provided
-if [ $# -eq 0 ]; then
-    echo "Error: No users provided."
-    display_help
-fi
 
 # Function to validate if a user exists
 user_exists() {
     local user="$1"
-    if getent passwd "$user" > /dev/null 2>&1; then
-        return 0  # User exists
+    getent passwd "$user" > /dev/null 2>&1
+}
+
+# Function to normalize time units (ms, s, m, etc.) to microseconds
+normalize_to_usec() {
+    local input="$1"
+    local number unit
+
+    if [[ "$input" =~ ^([0-9]+)([a-zA-Z]+)?$ ]]; then
+        number="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]:-us}"  # Default to microseconds
+        case "$unit" in
+            us) echo "$number" ;;
+            ms) echo $((number * 1000)) ;;
+            s)  echo $((number * 1000000)) ;;
+            m)  echo $((number * 1000)) ;;  # Sometimes systemd uses 'm' for milliseconds
+            *)  echo 0 ;;
+        esac
     else
-        return 1  # User does not exist
+        echo 0
     fi
 }
 
-# If verbose mode is enabled, display what we are about to do
-if [ $VERBOSE -eq 1 ]; then
-    echo "Setting CPU quota to '$CPU_QUOTA' for the following users: $@"
-    if [ $DRY_RUN -eq 1 ]; then
-        echo "Dry-run mode is enabled: No changes will be made."
-    fi
+# Check if arguments are passed, if not, display help
+if [ $# -eq 0 ]; then
+    display_help
 fi
 
-# Loop through all users and apply CPU quota
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--dry-run) DRY_RUN=1; shift ;;
+        -v|--verbose) VERBOSE=1; shift ;;
+        -s|--show)    SHOW_ONLY=1; shift ;;
+        -h|--help)    display_help ;;
+        *)            break ;;
+    esac
+done
+
+# Handle --show mode: display current CPUQuota for users
+if [ $SHOW_ONLY -eq 1 ]; then
+    if [ $# -eq 0 ]; then
+        echo "Error: No users provided."
+        display_help
+    fi
+    for user in "$@"; do
+        if ! user_exists "$user"; then
+            echo "User '$user' does not exist."
+            continue
+        fi
+        uid=$(id -u "$user")
+        slice="user-${uid}.slice"
+        raw_usec=$(systemctl show "$slice" --property=CPUQuotaPerSecUSec | cut -d= -f2)
+
+        # Handle case when CPUQuotaPerSecUSec is infinity
+        if [ "$raw_usec" == "infinity" ]; then
+            echo "$user ($slice): CPUQuotaPerSecUSec=infinity -> No CPU quota limit"
+            continue
+        fi
+
+        usec=$(normalize_to_usec "$raw_usec")
+        percent=$(awk -v us="$usec" 'BEGIN { printf "%.1f", (us / 10000) }')
+        echo "$user ($slice): CPUQuotaPerSecUSec=$raw_usec -> CPUQuota=${percent}%"
+    done
+    exit 0
+fi
+
+# Parse CPU_QUOTA and users
+CPU_QUOTA="${1:-}"
+shift
+
+if [ $# -eq 0 ]; then
+    echo "Error: Too few arguments."
+    display_help
+fi
+
+# Ensure CPU_QUOTA ends with a % sign, if not, add it
+if [ -n "$CPU_QUOTA" ] && [[ "$CPU_QUOTA" != *% ]]; then
+    CPU_QUOTA="${CPU_QUOTA}%"
+fi
+
+# Main loop: Set or remove CPUQuota for each user
 for user in "$@"; do
-    # Validate if the user exists
     if ! user_exists "$user"; then
         echo "Warning: User '$user' does not exist. Skipping."
         continue
     fi
 
-    # Get the user ID (UID) for the user
-    user_id=$(id -u "$user")
+    uid=$(id -u "$user")
+    slice="user-${uid}.slice"
 
-    # Define the slice name using the user ID
-    slice="user-${user_id}.slice"
-
-    # Construct the systemd command for setting CPUQuota
+    # Build the systemctl command based on CPU_QUOTA
     if [ -n "$CPU_QUOTA" ]; then
-        # Ensure the CPU_QUOTA has the percentage sign
-        if [[ "$CPU_QUOTA" != *% ]]; then
-            CPU_QUOTA="${CPU_QUOTA}%"
-        fi
-        # Set the specified CPUQuota
-        CMD="systemctl set-property $slice CPUQuota=$CPU_QUOTA"
+        CMD=(systemctl set-property "$slice" "CPUQuota=$CPU_QUOTA")
     else
-        # Remove the CPUQuota (empty value)
-        CMD="systemctl set-property $slice CPUQuota="
+        CMD=(systemctl set-property "$slice" "CPUQuota=")
     fi
 
-    # If verbose mode is enabled, print what is happening
+    # Verbose mode: Show detailed info
     if [ $VERBOSE -eq 1 ]; then
-        echo "Executing command for $user (UID: $user_id): $CMD"
+        echo "[Verbose] User '$user' (UID $uid), slice '$slice': ${CMD[*]}"
     fi
 
-    # Dry-run mode: print the command, but do not execute
+    # Dry run mode: Only print the command without executing it
     if [ $DRY_RUN -eq 1 ]; then
-        echo "Dry-run: $CMD"
+        echo "[Dry-run] ${CMD[*]}"
     else
-        # Execute the command to set or remove the CPUQuota
-        eval "$CMD"
+        "${CMD[@]}"
     fi
 done
